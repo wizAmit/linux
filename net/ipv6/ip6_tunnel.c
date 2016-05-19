@@ -122,41 +122,6 @@ static struct net_device_stats *ip6_get_stats(struct net_device *dev)
 	return &dev->stats;
 }
 
-/*
- * Locking : hash tables are protected by RCU and RTNL
- */
-
-struct dst_entry *ip6_tnl_dst_check(struct ip6_tnl *t)
-{
-	struct dst_entry *dst = t->dst_cache;
-
-	if (dst && dst->obsolete &&
-	    !dst->ops->check(dst, t->dst_cookie)) {
-		t->dst_cache = NULL;
-		dst_release(dst);
-		return NULL;
-	}
-
-	return dst;
-}
-EXPORT_SYMBOL_GPL(ip6_tnl_dst_check);
-
-void ip6_tnl_dst_reset(struct ip6_tnl *t)
-{
-	dst_release(t->dst_cache);
-	t->dst_cache = NULL;
-}
-EXPORT_SYMBOL_GPL(ip6_tnl_dst_reset);
-
-void ip6_tnl_dst_store(struct ip6_tnl *t, struct dst_entry *dst)
-{
-	struct rt6_info *rt = (struct rt6_info *) dst;
-	t->dst_cookie = rt->rt6i_node ? rt->rt6i_node->fn_sernum : 0;
-	dst_release(t->dst_cache);
-	t->dst_cache = dst;
-}
-EXPORT_SYMBOL_GPL(ip6_tnl_dst_store);
-
 /**
  * ip6_tnl_lookup - fetch tunnel matching the end-point addresses
  *   @remote: the address of the tunnel exit-point
@@ -271,6 +236,10 @@ ip6_tnl_unlink(struct ip6_tnl_net *ip6n, struct ip6_tnl *t)
 
 static void ip6_dev_free(struct net_device *dev)
 {
+	struct ip6_tnl *t = netdev_priv(dev);
+
+	gro_cells_destroy(&t->gro_cells);
+	dst_cache_destroy(&t->dst_cache);
 	free_percpu(dev->tstats);
 	free_netdev(dev);
 }
@@ -284,12 +253,12 @@ static int ip6_tnl_create2(struct net_device *dev)
 
 	t = netdev_priv(dev);
 
+	dev->rtnl_link_ops = &ip6_link_ops;
 	err = register_netdevice(dev);
 	if (err < 0)
 		goto out;
 
 	strcpy(t->parms.name, dev->name);
-	dev->rtnl_link_ops = &ip6_link_ops;
 
 	dev_hold(dev);
 	ip6_tnl_link(ip6n, t);
@@ -403,7 +372,7 @@ ip6_tnl_dev_uninit(struct net_device *dev)
 		RCU_INIT_POINTER(ip6n->tnls_wc[0], NULL);
 	else
 		ip6_tnl_unlink(ip6n, t);
-	ip6_tnl_dst_reset(t);
+	dst_cache_reset(&t->dst_cache);
 	dev_put(dev);
 }
 
@@ -510,14 +479,14 @@ ip6_tnl_err(struct sk_buff *skb, __u8 ipproto, struct inet6_skb_parm *opt,
 		struct ipv6_tlv_tnl_enc_lim *tel;
 		__u32 mtu;
 	case ICMPV6_DEST_UNREACH:
-		net_warn_ratelimited("%s: Path to destination invalid or inactive!\n",
-				     t->parms.name);
+		net_dbg_ratelimited("%s: Path to destination invalid or inactive!\n",
+				    t->parms.name);
 		rel_msg = 1;
 		break;
 	case ICMPV6_TIME_EXCEED:
 		if ((*code) == ICMPV6_EXC_HOPLIMIT) {
-			net_warn_ratelimited("%s: Too small hop limit or routing loop in tunnel!\n",
-					     t->parms.name);
+			net_dbg_ratelimited("%s: Too small hop limit or routing loop in tunnel!\n",
+					    t->parms.name);
 			rel_msg = 1;
 		}
 		break;
@@ -529,13 +498,13 @@ ip6_tnl_err(struct sk_buff *skb, __u8 ipproto, struct inet6_skb_parm *opt,
 		if (teli && teli == *info - 2) {
 			tel = (struct ipv6_tlv_tnl_enc_lim *) &skb->data[teli];
 			if (tel->encap_limit == 0) {
-				net_warn_ratelimited("%s: Too small encapsulation limit or routing loop in tunnel!\n",
-						     t->parms.name);
+				net_dbg_ratelimited("%s: Too small encapsulation limit or routing loop in tunnel!\n",
+						    t->parms.name);
 				rel_msg = 1;
 			}
 		} else {
-			net_warn_ratelimited("%s: Recipient unable to parse tunneled packet!\n",
-					     t->parms.name);
+			net_dbg_ratelimited("%s: Recipient unable to parse tunneled packet!\n",
+					    t->parms.name);
 		}
 		break;
 	case ICMPV6_PKT_TOOBIG:
@@ -785,97 +754,157 @@ int ip6_tnl_rcv_ctl(struct ip6_tnl *t,
 }
 EXPORT_SYMBOL_GPL(ip6_tnl_rcv_ctl);
 
-/**
- * ip6_tnl_rcv - decapsulate IPv6 packet and retransmit it locally
- *   @skb: received socket buffer
- *   @protocol: ethernet protocol ID
- *   @dscp_ecn_decapsulate: the function to decapsulate DSCP code and ECN
- *
- * Return: 0
- **/
+static int __ip6_tnl_rcv(struct ip6_tnl *tunnel, struct sk_buff *skb,
+			 const struct tnl_ptk_info *tpi,
+			 struct metadata_dst *tun_dst,
+			 int (*dscp_ecn_decapsulate)(const struct ip6_tnl *t,
+						const struct ipv6hdr *ipv6h,
+						struct sk_buff *skb),
+			 bool log_ecn_err)
+{
+	struct pcpu_sw_netstats *tstats;
+	const struct ipv6hdr *ipv6h = ipv6_hdr(skb);
+	int err;
 
-static int ip6_tnl_rcv(struct sk_buff *skb, __u16 protocol,
-		       __u8 ipproto,
-		       int (*dscp_ecn_decapsulate)(const struct ip6_tnl *t,
-						   const struct ipv6hdr *ipv6h,
-						   struct sk_buff *skb))
+	if ((!(tpi->flags & TUNNEL_CSUM) &&
+	     (tunnel->parms.i_flags & TUNNEL_CSUM)) ||
+	    ((tpi->flags & TUNNEL_CSUM) &&
+	     !(tunnel->parms.i_flags & TUNNEL_CSUM))) {
+		tunnel->dev->stats.rx_crc_errors++;
+		tunnel->dev->stats.rx_errors++;
+		goto drop;
+	}
+
+	if (tunnel->parms.i_flags & TUNNEL_SEQ) {
+		if (!(tpi->flags & TUNNEL_SEQ) ||
+		    (tunnel->i_seqno &&
+		     (s32)(ntohl(tpi->seq) - tunnel->i_seqno) < 0)) {
+			tunnel->dev->stats.rx_fifo_errors++;
+			tunnel->dev->stats.rx_errors++;
+			goto drop;
+		}
+		tunnel->i_seqno = ntohl(tpi->seq) + 1;
+	}
+
+	skb->protocol = tpi->proto;
+
+	/* Warning: All skb pointers will be invalidated! */
+	if (tunnel->dev->type == ARPHRD_ETHER) {
+		if (!pskb_may_pull(skb, ETH_HLEN)) {
+			tunnel->dev->stats.rx_length_errors++;
+			tunnel->dev->stats.rx_errors++;
+			goto drop;
+		}
+
+		ipv6h = ipv6_hdr(skb);
+		skb->protocol = eth_type_trans(skb, tunnel->dev);
+		skb_postpull_rcsum(skb, eth_hdr(skb), ETH_HLEN);
+	} else {
+		skb->dev = tunnel->dev;
+	}
+
+	skb_reset_network_header(skb);
+	memset(skb->cb, 0, sizeof(struct inet6_skb_parm));
+
+	__skb_tunnel_rx(skb, tunnel->dev, tunnel->net);
+
+	err = dscp_ecn_decapsulate(tunnel, ipv6h, skb);
+	if (unlikely(err)) {
+		if (log_ecn_err)
+			net_info_ratelimited("non-ECT from %pI6 with DS=%#x\n",
+					     &ipv6h->saddr,
+					     ipv6_get_dsfield(ipv6h));
+		if (err > 1) {
+			++tunnel->dev->stats.rx_frame_errors;
+			++tunnel->dev->stats.rx_errors;
+			goto drop;
+		}
+	}
+
+	tstats = this_cpu_ptr(tunnel->dev->tstats);
+	u64_stats_update_begin(&tstats->syncp);
+	tstats->rx_packets++;
+	tstats->rx_bytes += skb->len;
+	u64_stats_update_end(&tstats->syncp);
+
+	skb_scrub_packet(skb, !net_eq(tunnel->net, dev_net(tunnel->dev)));
+
+	gro_cells_receive(&tunnel->gro_cells, skb);
+	return 0;
+
+drop:
+	kfree_skb(skb);
+	return 0;
+}
+
+int ip6_tnl_rcv(struct ip6_tnl *t, struct sk_buff *skb,
+		const struct tnl_ptk_info *tpi,
+		struct metadata_dst *tun_dst,
+		bool log_ecn_err)
+{
+	return __ip6_tnl_rcv(t, skb, tpi, NULL, ip6ip6_dscp_ecn_decapsulate,
+			     log_ecn_err);
+}
+EXPORT_SYMBOL(ip6_tnl_rcv);
+
+static const struct tnl_ptk_info tpi_v6 = {
+	/* no tunnel info required for ipxip6. */
+	.proto = htons(ETH_P_IPV6),
+};
+
+static const struct tnl_ptk_info tpi_v4 = {
+	/* no tunnel info required for ipxip6. */
+	.proto = htons(ETH_P_IP),
+};
+
+static int ipxip6_rcv(struct sk_buff *skb, u8 ipproto,
+		      const struct tnl_ptk_info *tpi,
+		      int (*dscp_ecn_decapsulate)(const struct ip6_tnl *t,
+						  const struct ipv6hdr *ipv6h,
+						  struct sk_buff *skb))
 {
 	struct ip6_tnl *t;
 	const struct ipv6hdr *ipv6h = ipv6_hdr(skb);
-	u8 tproto;
-	int err;
+	int ret = -1;
 
 	rcu_read_lock();
 	t = ip6_tnl_lookup(dev_net(skb->dev), &ipv6h->saddr, &ipv6h->daddr);
+
 	if (t) {
-		struct pcpu_sw_netstats *tstats;
+		u8 tproto = ACCESS_ONCE(t->parms.proto);
 
-		tproto = ACCESS_ONCE(t->parms.proto);
-		if (tproto != ipproto && tproto != 0) {
-			rcu_read_unlock();
-			goto discard;
-		}
-
-		if (!xfrm6_policy_check(NULL, XFRM_POLICY_IN, skb)) {
-			rcu_read_unlock();
-			goto discard;
-		}
-
-		if (!ip6_tnl_rcv_ctl(t, &ipv6h->daddr, &ipv6h->saddr)) {
-			t->dev->stats.rx_dropped++;
-			rcu_read_unlock();
-			goto discard;
-		}
-		skb->mac_header = skb->network_header;
-		skb_reset_network_header(skb);
-		skb->protocol = htons(protocol);
-		memset(skb->cb, 0, sizeof(struct inet6_skb_parm));
-
-		__skb_tunnel_rx(skb, t->dev, t->net);
-
-		err = dscp_ecn_decapsulate(t, ipv6h, skb);
-		if (unlikely(err)) {
-			if (log_ecn_error)
-				net_info_ratelimited("non-ECT from %pI6 with dsfield=%#x\n",
-						     &ipv6h->saddr,
-						     ipv6_get_dsfield(ipv6h));
-			if (err > 1) {
-				++t->dev->stats.rx_frame_errors;
-				++t->dev->stats.rx_errors;
-				rcu_read_unlock();
-				goto discard;
-			}
-		}
-
-		tstats = this_cpu_ptr(t->dev->tstats);
-		u64_stats_update_begin(&tstats->syncp);
-		tstats->rx_packets++;
-		tstats->rx_bytes += skb->len;
-		u64_stats_update_end(&tstats->syncp);
-
-		netif_rx(skb);
-
-		rcu_read_unlock();
-		return 0;
+		if (tproto != ipproto && tproto != 0)
+			goto drop;
+		if (!xfrm6_policy_check(NULL, XFRM_POLICY_IN, skb))
+			goto drop;
+		if (!ip6_tnl_rcv_ctl(t, &ipv6h->daddr, &ipv6h->saddr))
+			goto drop;
+		if (iptunnel_pull_header(skb, 0, tpi->proto, false))
+			goto drop;
+		ret = __ip6_tnl_rcv(t, skb, tpi, NULL, dscp_ecn_decapsulate,
+				    log_ecn_error);
 	}
-	rcu_read_unlock();
-	return 1;
 
-discard:
+	rcu_read_unlock();
+
+	return ret;
+
+drop:
+	rcu_read_unlock();
 	kfree_skb(skb);
 	return 0;
 }
 
 static int ip4ip6_rcv(struct sk_buff *skb)
 {
-	return ip6_tnl_rcv(skb, ETH_P_IP, IPPROTO_IPIP,
-			   ip4ip6_dscp_ecn_decapsulate);
+	return ipxip6_rcv(skb, IPPROTO_IPIP, &tpi_v4,
+			  ip4ip6_dscp_ecn_decapsulate);
 }
 
 static int ip6ip6_rcv(struct sk_buff *skb)
 {
-	return ip6_tnl_rcv(skb, ETH_P_IPV6, IPPROTO_IPV6,
-			   ip6ip6_dscp_ecn_decapsulate);
+	return ipxip6_rcv(skb, IPPROTO_IPV6, &tpi_v6,
+			  ip6ip6_dscp_ecn_decapsulate);
 }
 
 struct ipv6_tel_txoption {
@@ -950,13 +979,14 @@ int ip6_tnl_xmit_ctl(struct ip6_tnl *t,
 EXPORT_SYMBOL_GPL(ip6_tnl_xmit_ctl);
 
 /**
- * ip6_tnl_xmit2 - encapsulate packet and send
+ * ip6_tnl_xmit - encapsulate packet and send
  *   @skb: the outgoing socket buffer
  *   @dev: the outgoing tunnel device
  *   @dsfield: dscp code for outer header
- *   @fl: flow of tunneled packet
+ *   @fl6: flow of tunneled packet
  *   @encap_limit: encapsulation limit
  *   @pmtu: Path MTU is stored if packet is too big
+ *   @proto: next header value
  *
  * Description:
  *   Build new header and do some sanity checks on the packet before sending
@@ -968,12 +998,9 @@ EXPORT_SYMBOL_GPL(ip6_tnl_xmit_ctl);
  *   %-EMSGSIZE message too big. return mtu in this case.
  **/
 
-static int ip6_tnl_xmit2(struct sk_buff *skb,
-			 struct net_device *dev,
-			 __u8 dsfield,
-			 struct flowi6 *fl6,
-			 int encap_limit,
-			 __u32 *pmtu)
+int ip6_tnl_xmit(struct sk_buff *skb, struct net_device *dev, __u8 dsfield,
+		 struct flowi6 *fl6, int encap_limit, __u32 *pmtu,
+		 __u8 proto)
 {
 	struct ip6_tnl *t = netdev_priv(dev);
 	struct net *net = t->net;
@@ -984,7 +1011,6 @@ static int ip6_tnl_xmit2(struct sk_buff *skb,
 	struct net_device *tdev;
 	int mtu;
 	unsigned int max_headroom = sizeof(struct ipv6hdr);
-	u8 proto;
 	int err = -1;
 
 	/* NBMA tunnel */
@@ -1010,23 +1036,23 @@ static int ip6_tnl_xmit2(struct sk_buff *skb,
 		memcpy(&fl6->daddr, addr6, sizeof(fl6->daddr));
 		neigh_release(neigh);
 	} else if (!fl6->flowi6_mark)
-		dst = ip6_tnl_dst_check(t);
+		dst = dst_cache_get(&t->dst_cache);
 
 	if (!ip6_tnl_xmit_ctl(t, &fl6->saddr, &fl6->daddr))
 		goto tx_err_link_failure;
 
 	if (!dst) {
-		ndst = ip6_route_output(net, NULL, fl6);
+		dst = ip6_route_output(net, NULL, fl6);
 
-		if (ndst->error)
+		if (dst->error)
 			goto tx_err_link_failure;
-		ndst = xfrm_lookup(net, ndst, flowi6_to_flowi(fl6), NULL, 0);
-		if (IS_ERR(ndst)) {
-			err = PTR_ERR(ndst);
-			ndst = NULL;
+		dst = xfrm_lookup(net, dst, flowi6_to_flowi(fl6), NULL, 0);
+		if (IS_ERR(dst)) {
+			err = PTR_ERR(dst);
+			dst = NULL;
 			goto tx_err_link_failure;
 		}
-		dst = ndst;
+		ndst = dst;
 	}
 
 	tdev = dst->dev;
@@ -1046,10 +1072,21 @@ static int ip6_tnl_xmit2(struct sk_buff *skb,
 		mtu = IPV6_MIN_MTU;
 	if (skb_dst(skb))
 		skb_dst(skb)->ops->update_pmtu(skb_dst(skb), NULL, skb, mtu);
-	if (skb->len > mtu) {
+	if (skb->len > mtu && !skb_is_gso(skb)) {
 		*pmtu = mtu;
 		err = -EMSGSIZE;
 		goto tx_err_dst_release;
+	}
+
+	if (t->err_count > 0) {
+		if (time_before(jiffies,
+				t->err_time + IP6TUNNEL_ERR_TIMEO)) {
+			t->err_count--;
+
+			dst_link_failure(skb);
+		} else {
+			t->err_count = 0;
+		}
 	}
 
 	skb_scrub_packet(skb, !net_eq(t->net, dev_net(dev)));
@@ -1072,15 +1109,11 @@ static int ip6_tnl_xmit2(struct sk_buff *skb,
 		consume_skb(skb);
 		skb = new_skb;
 	}
-	if (fl6->flowi6_mark) {
-		skb_dst_set(skb, dst);
-		ndst = NULL;
-	} else {
-		skb_dst_set_noref(skb, dst);
-	}
-	skb->transport_header = skb->network_header;
 
-	proto = fl6->flowi6_proto;
+	if (!fl6->flowi6_mark && ndst)
+		dst_cache_set_ip6(&t->dst_cache, ndst, &fl6->saddr);
+	skb_dst_set(skb, dst);
+
 	if (encap_limit >= 0) {
 		init_tel_txopt(&opt, encap_limit);
 		ipv6_push_nfrag_opts(skb, &opt.ops, &proto, NULL);
@@ -1091,26 +1124,30 @@ static int ip6_tnl_xmit2(struct sk_buff *skb,
 		skb->encapsulation = 1;
 	}
 
+	max_headroom = LL_RESERVED_SPACE(dst->dev) + sizeof(struct ipv6hdr)
+			+ dst->header_len;
+	if (max_headroom > dev->needed_headroom)
+		dev->needed_headroom = max_headroom;
+
 	skb_push(skb, sizeof(struct ipv6hdr));
 	skb_reset_network_header(skb);
 	ipv6h = ipv6_hdr(skb);
 	ip6_flow_hdr(ipv6h, INET_ECN_encapsulate(0, dsfield),
-		     ip6_make_flowlabel(net, skb, fl6->flowlabel, false));
+		     ip6_make_flowlabel(net, skb, fl6->flowlabel, true, fl6));
 	ipv6h->hop_limit = t->parms.hop_limit;
 	ipv6h->nexthdr = proto;
 	ipv6h->saddr = fl6->saddr;
 	ipv6h->daddr = fl6->daddr;
 	ip6tunnel_xmit(NULL, skb, dev);
-	if (ndst)
-		ip6_tnl_dst_store(t, ndst);
 	return 0;
 tx_err_link_failure:
 	stats->tx_carrier_errors++;
 	dst_link_failure(skb);
 tx_err_dst_release:
-	dst_release(ndst);
+	dst_release(dst);
 	return err;
 }
+EXPORT_SYMBOL(ip6_tnl_xmit);
 
 static inline int
 ip4ip6_tnl_xmit(struct sk_buff *skb, struct net_device *dev)
@@ -1124,6 +1161,8 @@ ip4ip6_tnl_xmit(struct sk_buff *skb, struct net_device *dev)
 	u8 tproto;
 	int err;
 
+	memset(&(IPCB(skb)->opt), 0, sizeof(IPCB(skb)->opt));
+
 	tproto = ACCESS_ONCE(t->parms.proto);
 	if (tproto != IPPROTO_IPIP && tproto != 0)
 		return -1;
@@ -1132,7 +1171,6 @@ ip4ip6_tnl_xmit(struct sk_buff *skb, struct net_device *dev)
 		encap_limit = t->parms.encap_limit;
 
 	memcpy(&fl6, &t->fl.u.ip6, sizeof(fl6));
-	fl6.flowi6_proto = IPPROTO_IPIP;
 
 	dsfield = ipv4_get_dsfield(iph);
 
@@ -1142,7 +1180,8 @@ ip4ip6_tnl_xmit(struct sk_buff *skb, struct net_device *dev)
 	if (t->parms.flags & IP6_TNL_F_USE_ORIG_FWMARK)
 		fl6.flowi6_mark = skb->mark;
 
-	err = ip6_tnl_xmit2(skb, dev, dsfield, &fl6, encap_limit, &mtu);
+	err = ip6_tnl_xmit(skb, dev, dsfield, &fl6, encap_limit, &mtu,
+			   IPPROTO_IPIP);
 	if (err != 0) {
 		/* XXX: send ICMP error even if DF is not set. */
 		if (err == -EMSGSIZE)
@@ -1186,7 +1225,6 @@ ip6ip6_tnl_xmit(struct sk_buff *skb, struct net_device *dev)
 		encap_limit = t->parms.encap_limit;
 
 	memcpy(&fl6, &t->fl.u.ip6, sizeof(fl6));
-	fl6.flowi6_proto = IPPROTO_IPV6;
 
 	dsfield = ipv6_get_dsfield(ipv6h);
 	if (t->parms.flags & IP6_TNL_F_USE_ORIG_TCLASS)
@@ -1196,7 +1234,8 @@ ip6ip6_tnl_xmit(struct sk_buff *skb, struct net_device *dev)
 	if (t->parms.flags & IP6_TNL_F_USE_ORIG_FWMARK)
 		fl6.flowi6_mark = skb->mark;
 
-	err = ip6_tnl_xmit2(skb, dev, dsfield, &fl6, encap_limit, &mtu);
+	err = ip6_tnl_xmit(skb, dev, dsfield, &fl6, encap_limit, &mtu,
+			   IPPROTO_IPV6);
 	if (err != 0) {
 		if (err == -EMSGSIZE)
 			icmpv6_send(skb, ICMPV6_PKT_TOOBIG, 0, mtu);
@@ -1207,7 +1246,7 @@ ip6ip6_tnl_xmit(struct sk_buff *skb, struct net_device *dev)
 }
 
 static netdev_tx_t
-ip6_tnl_xmit(struct sk_buff *skb, struct net_device *dev)
+ip6_tnl_start_xmit(struct sk_buff *skb, struct net_device *dev)
 {
 	struct ip6_tnl *t = netdev_priv(dev);
 	struct net_device_stats *stats = &t->dev->stats;
@@ -1310,7 +1349,7 @@ ip6_tnl_change(struct ip6_tnl *t, const struct __ip6_tnl_parm *p)
 	t->parms.flowinfo = p->flowinfo;
 	t->parms.link = p->link;
 	t->parms.proto = p->proto;
-	ip6_tnl_dst_reset(t);
+	dst_cache_reset(&t->dst_cache);
 	ip6_tnl_link_config(t);
 	return 0;
 }
@@ -1402,6 +1441,8 @@ ip6_tnl_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 	struct ip6_tnl *t = netdev_priv(dev);
 	struct net *net = t->net;
 	struct ip6_tnl_net *ip6n = net_generic(net, ip6_tnl_net_id);
+
+	memset(&p1, 0, sizeof(p1));
 
 	switch (cmd) {
 	case SIOCGETTUNNEL:
@@ -1497,8 +1538,7 @@ ip6_tnl_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
  *   %-EINVAL if mtu too small
  **/
 
-static int
-ip6_tnl_change_mtu(struct net_device *dev, int new_mtu)
+int ip6_tnl_change_mtu(struct net_device *dev, int new_mtu)
 {
 	struct ip6_tnl *tnl = netdev_priv(dev);
 
@@ -1514,6 +1554,7 @@ ip6_tnl_change_mtu(struct net_device *dev, int new_mtu)
 	dev->mtu = new_mtu;
 	return 0;
 }
+EXPORT_SYMBOL(ip6_tnl_change_mtu);
 
 int ip6_tnl_get_iflink(const struct net_device *dev)
 {
@@ -1526,7 +1567,7 @@ EXPORT_SYMBOL(ip6_tnl_get_iflink);
 static const struct net_device_ops ip6_tnl_netdev_ops = {
 	.ndo_init	= ip6_tnl_dev_init,
 	.ndo_uninit	= ip6_tnl_dev_uninit,
-	.ndo_start_xmit = ip6_tnl_xmit,
+	.ndo_start_xmit = ip6_tnl_start_xmit,
 	.ndo_do_ioctl	= ip6_tnl_ioctl,
 	.ndo_change_mtu = ip6_tnl_change_mtu,
 	.ndo_get_stats	= ip6_get_stats,
@@ -1573,13 +1614,34 @@ static inline int
 ip6_tnl_dev_init_gen(struct net_device *dev)
 {
 	struct ip6_tnl *t = netdev_priv(dev);
+	int ret;
 
 	t->dev = dev;
 	t->net = dev_net(dev);
 	dev->tstats = netdev_alloc_pcpu_stats(struct pcpu_sw_netstats);
 	if (!dev->tstats)
 		return -ENOMEM;
+
+	ret = dst_cache_init(&t->dst_cache, GFP_KERNEL);
+	if (ret)
+		goto free_stats;
+
+	ret = gro_cells_init(&t->gro_cells, dev);
+	if (ret)
+		goto destroy_dst;
+
+	t->hlen = 0;
+	t->tun_hlen = 0;
+
 	return 0;
+
+destroy_dst:
+	dst_cache_destroy(&t->dst_cache);
+free_stats:
+	free_percpu(dev->tstats);
+	dev->tstats = NULL;
+
+	return ret;
 }
 
 /**

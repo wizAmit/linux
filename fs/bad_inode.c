@@ -106,8 +106,8 @@ static int bad_inode_setxattr(struct dentry *dentry, const char *name,
 	return -EIO;
 }
 
-static ssize_t bad_inode_getxattr(struct dentry *dentry, const char *name,
-			void *buffer, size_t size)
+static ssize_t bad_inode_getxattr(struct dentry *dentry, struct inode *inode,
+			const char *name, void *buffer, size_t size)
 {
 	return -EIO;
 }
@@ -192,7 +192,7 @@ EXPORT_SYMBOL(make_bad_inode);
  *	Returns true if the inode in question has been marked as bad.
  */
  
-int is_bad_inode(struct inode *inode)
+bool is_bad_inode(struct inode *inode)
 {
 	return (inode->i_op == &bad_inode_ops);	
 }

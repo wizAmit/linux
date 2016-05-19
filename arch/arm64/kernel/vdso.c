@@ -131,11 +131,11 @@ static int __init vdso_init(void)
 		return -ENOMEM;
 
 	/* Grab the vDSO data page. */
-	vdso_pagelist[0] = virt_to_page(vdso_data);
+	vdso_pagelist[0] = pfn_to_page(PHYS_PFN(__pa(vdso_data)));
 
 	/* Grab the vDSO code pages. */
 	for (i = 0; i < vdso_pages; i++)
-		vdso_pagelist[i + 1] = virt_to_page(&vdso_start + i * PAGE_SIZE);
+		vdso_pagelist[i + 1] = pfn_to_page(PHYS_PFN(__pa(&vdso_start)) + i);
 
 	/* Populate the special mapping structures */
 	vdso_spec[0] = (struct vm_special_mapping) {
@@ -199,16 +199,15 @@ up_fail:
  */
 void update_vsyscall(struct timekeeper *tk)
 {
-	struct timespec xtime_coarse;
 	u32 use_syscall = strcmp(tk->tkr_mono.clock->name, "arch_sys_counter");
 
 	++vdso_data->tb_seq_count;
 	smp_wmb();
 
-	xtime_coarse = __current_kernel_time();
 	vdso_data->use_syscall			= use_syscall;
-	vdso_data->xtime_coarse_sec		= xtime_coarse.tv_sec;
-	vdso_data->xtime_coarse_nsec		= xtime_coarse.tv_nsec;
+	vdso_data->xtime_coarse_sec		= tk->xtime_sec;
+	vdso_data->xtime_coarse_nsec		= tk->tkr_mono.xtime_nsec >>
+							tk->tkr_mono.shift;
 	vdso_data->wtm_clock_sec		= tk->wall_to_monotonic.tv_sec;
 	vdso_data->wtm_clock_nsec		= tk->wall_to_monotonic.tv_nsec;
 

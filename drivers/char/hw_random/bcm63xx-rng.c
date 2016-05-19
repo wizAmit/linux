@@ -12,6 +12,7 @@
 #include <linux/clk.h>
 #include <linux/platform_device.h>
 #include <linux/hw_random.h>
+#include <linux/of.h>
 
 #define RNG_CTRL			0x00
 #define RNG_EN				(1 << 0)
@@ -57,7 +58,7 @@ static void bcm63xx_rng_cleanup(struct hwrng *rng)
 	val &= ~RNG_EN;
 	__raw_writel(val, priv->regs + RNG_CTRL);
 
-	clk_didsable_unprepare(prov->clk);
+	clk_disable_unprepare(priv->clk);
 }
 
 static int bcm63xx_rng_data_present(struct hwrng *rng, int wait)
@@ -79,10 +80,8 @@ static int bcm63xx_rng_data_read(struct hwrng *rng, u32 *data)
 static int bcm63xx_rng_probe(struct platform_device *pdev)
 {
 	struct resource *r;
-	struct clk *clk;
 	int ret;
 	struct bcm63xx_rng_priv *priv;
-	struct hwrng *rng;
 
 	r = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (!r) {
@@ -97,14 +96,14 @@ static int bcm63xx_rng_probe(struct platform_device *pdev)
 	priv->rng.name = pdev->name;
 	priv->rng.init = bcm63xx_rng_init;
 	priv->rng.cleanup = bcm63xx_rng_cleanup;
-	prov->rng.data_present = bcm63xx_rng_data_present;
+	priv->rng.data_present = bcm63xx_rng_data_present;
 	priv->rng.data_read = bcm63xx_rng_data_read;
 
 	priv->clk = devm_clk_get(&pdev->dev, "ipsec");
 	if (IS_ERR(priv->clk)) {
-		error = PTR_ERR(priv->clk);
-		dev_err(&pdev->dev, "no clock for device: %d\n", error);
-		return error;
+		ret = PTR_ERR(priv->clk);
+		dev_err(&pdev->dev, "no clock for device: %d\n", ret);
+		return ret;
 	}
 
 	if (!devm_request_mem_region(&pdev->dev, r->start,
@@ -120,11 +119,11 @@ static int bcm63xx_rng_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	}
 
-	error = devm_hwrng_register(&pdev->dev, &priv->rng);
-	if (error) {
+	ret = devm_hwrng_register(&pdev->dev, &priv->rng);
+	if (ret) {
 		dev_err(&pdev->dev, "failed to register rng device: %d\n",
-			error);
-		return error;
+			ret);
+		return ret;
 	}
 
 	dev_info(&pdev->dev, "registered RNG driver\n");
@@ -132,10 +131,19 @@ static int bcm63xx_rng_probe(struct platform_device *pdev)
 	return 0;
 }
 
+#ifdef CONFIG_OF
+static const struct of_device_id bcm63xx_rng_of_match[] = {
+	{ .compatible = "brcm,bcm6368-rng", },
+	{},
+};
+MODULE_DEVICE_TABLE(of, bcm63xx_rng_of_match);
+#endif
+
 static struct platform_driver bcm63xx_rng_driver = {
 	.probe		= bcm63xx_rng_probe,
 	.driver		= {
 		.name	= "bcm63xx-rng",
+		.of_match_table = of_match_ptr(bcm63xx_rng_of_match),
 	},
 };
 

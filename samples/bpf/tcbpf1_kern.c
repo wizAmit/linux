@@ -4,6 +4,8 @@
 #include <uapi/linux/ip.h>
 #include <uapi/linux/in.h>
 #include <uapi/linux/tcp.h>
+#include <uapi/linux/filter.h>
+#include <uapi/linux/pkt_cls.h>
 #include "bpf_helpers.h"
 
 /* compiler workaround */
@@ -13,12 +15,6 @@ static inline void set_dst_mac(struct __sk_buff *skb, char *mac)
 {
 	bpf_skb_store_bytes(skb, 0, mac, ETH_ALEN, 1);
 }
-
-/* use 1 below for ingress qdisc and 0 for egress */
-#if 0
-#undef ETH_HLEN
-#define ETH_HLEN 0
-#endif
 
 #define IP_CSUM_OFF (ETH_HLEN + offsetof(struct iphdr, check))
 #define TOS_OFF (ETH_HLEN + offsetof(struct iphdr, tos))
@@ -67,5 +63,27 @@ int bpf_prog1(struct __sk_buff *skb)
 	}
 
 	return 0;
+}
+SEC("redirect_xmit")
+int _redirect_xmit(struct __sk_buff *skb)
+{
+	return bpf_redirect(skb->ifindex + 1, 0);
+}
+SEC("redirect_recv")
+int _redirect_recv(struct __sk_buff *skb)
+{
+	return bpf_redirect(skb->ifindex + 1, 1);
+}
+SEC("clone_redirect_xmit")
+int _clone_redirect_xmit(struct __sk_buff *skb)
+{
+	bpf_clone_redirect(skb, skb->ifindex + 1, 0);
+	return TC_ACT_SHOT;
+}
+SEC("clone_redirect_recv")
+int _clone_redirect_recv(struct __sk_buff *skb)
+{
+	bpf_clone_redirect(skb, skb->ifindex + 1, 1);
+	return TC_ACT_SHOT;
 }
 char _license[] SEC("license") = "GPL";

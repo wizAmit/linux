@@ -31,6 +31,7 @@ static struct sk_buff *mpls_gso_segment(struct sk_buff *skb,
 				  SKB_GSO_TCPV6 |
 				  SKB_GSO_UDP |
 				  SKB_GSO_DODGY |
+				  SKB_GSO_TCP_FIXEDID |
 				  SKB_GSO_TCP_ECN)))
 		goto out;
 
@@ -62,6 +63,7 @@ out:
 
 static struct packet_offload mpls_mc_offload __read_mostly = {
 	.type = cpu_to_be16(ETH_P_MPLS_MC),
+	.priority = 15,
 	.callbacks = {
 		.gso_segment    =	mpls_gso_segment,
 	},
@@ -69,6 +71,7 @@ static struct packet_offload mpls_mc_offload __read_mostly = {
 
 static struct packet_offload mpls_uc_offload __read_mostly = {
 	.type = cpu_to_be16(ETH_P_MPLS_UC),
+	.priority = 15,
 	.callbacks = {
 		.gso_segment    =	mpls_gso_segment,
 	},

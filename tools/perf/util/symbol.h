@@ -34,8 +34,8 @@
 #endif
 
 #ifdef HAVE_LIBELF_SUPPORT
-extern Elf_Scn *elf_section_by_name(Elf *elf, GElf_Ehdr *ep,
-				GElf_Shdr *shp, const char *name, size_t *idx);
+Elf_Scn *elf_section_by_name(Elf *elf, GElf_Ehdr *ep,
+			     GElf_Shdr *shp, const char *name, size_t *idx);
 #endif
 
 #ifndef DMGL_PARAMS
@@ -55,6 +55,7 @@ struct symbol {
 	u16		namelen;
 	u8		binding;
 	bool		ignore;
+	u8		arch_sym;
 	char		name[0];
 };
 
@@ -84,6 +85,7 @@ struct symbol_conf {
 	unsigned short	priv_size;
 	unsigned short	nr_events;
 	bool		try_vmlinux_path,
+			force,
 			ignore_vmlinux,
 			ignore_vmlinux_buildid,
 			show_kernel_path,
@@ -105,7 +107,12 @@ struct symbol_conf {
 			demangle_kernel,
 			filter_relative,
 			show_hist_headers,
-			branch_callstack;
+			branch_callstack,
+			has_filter,
+			show_ref_callgraph,
+			hide_unresolved,
+			raw_trace,
+			report_hierarchy;
 	const char	*vmlinux_name,
 			*kallsyms_name,
 			*source_prefix,
@@ -134,6 +141,11 @@ struct symbol_conf {
 
 extern struct symbol_conf symbol_conf;
 
+struct symbol_name_rb_node {
+	struct rb_node	rb_node;
+	struct symbol	sym;
+};
+
 static inline int __symbol__join_symfs(char *bf, size_t size, const char *path)
 {
 	return path__join(bf, size, symbol_conf.symfs, path);
@@ -158,8 +170,6 @@ struct ref_reloc_sym {
 struct map_symbol {
 	struct map    *map;
 	struct symbol *sym;
-	bool	      unfolded;
-	bool	      has_children;
 };
 
 struct addr_map_symbol {
@@ -191,6 +201,7 @@ struct addr_location {
 	u8	      filtered;
 	u8	      cpumode;
 	s32	      cpu;
+	s32	      socket;
 };
 
 struct symsrc {
@@ -230,8 +241,13 @@ int dso__load_vmlinux(struct dso *dso, struct map *map,
 		      symbol_filter_t filter);
 int dso__load_vmlinux_path(struct dso *dso, struct map *map,
 			   symbol_filter_t filter);
+int __dso__load_kallsyms(struct dso *dso, const char *filename, struct map *map,
+			 bool no_kcore, symbol_filter_t filter);
 int dso__load_kallsyms(struct dso *dso, const char *filename, struct map *map,
 		       symbol_filter_t filter);
+
+void dso__insert_symbol(struct dso *dso, enum map_type type,
+			struct symbol *sym);
 
 struct symbol *dso__find_symbol(struct dso *dso, enum map_type type,
 				u64 addr);
@@ -252,13 +268,19 @@ int modules__parse(const char *filename, void *arg,
 int filename__read_debuglink(const char *filename, char *debuglink,
 			     size_t size);
 
-struct perf_session_env;
-int symbol__init(struct perf_session_env *env);
+struct perf_env;
+int symbol__init(struct perf_env *env);
 void symbol__exit(void);
 void symbol__elf_init(void);
 struct symbol *symbol__new(u64 start, u64 len, u8 binding, const char *name);
+size_t __symbol__fprintf_symname_offs(const struct symbol *sym,
+				      const struct addr_location *al,
+				      bool unknown_as_addr, FILE *fp);
 size_t symbol__fprintf_symname_offs(const struct symbol *sym,
 				    const struct addr_location *al, FILE *fp);
+size_t __symbol__fprintf_symname(const struct symbol *sym,
+				 const struct addr_location *al,
+				 bool unknown_as_addr, FILE *fp);
 size_t symbol__fprintf_symname(const struct symbol *sym, FILE *fp);
 size_t symbol__fprintf(struct symbol *sym, FILE *fp);
 bool symbol_type__is_a(char symbol_type, enum map_type map_type);
@@ -302,5 +324,15 @@ int setup_list(struct strlist **list, const char *list_str,
 	       const char *list_name);
 int setup_intlist(struct intlist **list, const char *list_str,
 		  const char *list_name);
+
+#ifdef HAVE_LIBELF_SUPPORT
+bool elf__needs_adjust_symbols(GElf_Ehdr ehdr);
+void arch__sym_update(struct symbol *s, GElf_Sym *sym);
+#endif
+
+#define SYMBOL_A 0
+#define SYMBOL_B 1
+
+int arch__choose_best_symbol(struct symbol *syma, struct symbol *symb);
 
 #endif /* __PERF_SYMBOL */

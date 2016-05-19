@@ -39,12 +39,13 @@
  */
 struct thread_info {
 	struct task_struct *task;		/* main task structure */
-	struct exec_domain *exec_domain;	/* execution domain */
 	int		cpu;			/* cpu we're on */
 	int		preempt_count;		/* 0 => preemptable,
 						   <0 => BUG */
 	unsigned long	local_flags;		/* private flags for thread */
-
+#ifdef CONFIG_LIVEPATCH
+	unsigned long *livepatch_sp;
+#endif
 	/* low level flags - has atomic operations done on it */
 	unsigned long	flags ____cacheline_aligned_in_smp;
 };
@@ -55,7 +56,6 @@ struct thread_info {
 #define INIT_THREAD_INFO(tsk)			\
 {						\
 	.task =		&tsk,			\
-	.exec_domain =	&default_exec_domain,	\
 	.cpu =		0,			\
 	.preempt_count = INIT_PREEMPT_COUNT,	\
 	.flags =	0,			\
